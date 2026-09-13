@@ -1,0 +1,614 @@
+import {
+  InventoryMovementType,
+  NotificationType,
+  Prisma,
+  SellerOrderGroupStatus,
+  UserRole,
+  WalletTransactionType,
+} from "@prisma/client";
+import prisma from "@/lib/prisma";
+import { reserveSequentialId } from "@/lib/id-sequence";
+import {
+  createAuditLog,
+  createNotification,
+  createWalletTransaction,
+  getOrCreateSellerWallet,
+  syncParentOrderStatusFromGroups,
+} from "@/lib/wallet-utils";
+
+function toJsonValue(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value ?? null)) as Prisma.InputJsonValue;
+}
+
+function statusLabel(status: SellerOrderGroupStatus) {
+  switch (status) {
+    case SellerOrderGroupStatus.PENDING:
+      return "Pending";
+    case SellerOrderGroupStatus.CONFIRMED:
+      return "Confirmed";
+    case SellerOrderGroupStatus.PROCESSING:
+      return "Processing";
+    case SellerOrderGroupStatus.SHIPPED:
+      return "Shipped";
+    case SellerOrderGroupStatus.DELIVERED:
+      return "Delivered";
+    case SellerOrderGroupStatus.CANCELLED:
+      return "Cancelled";
+    case SellerOrderGroupStatus.REFUNDED:
+      return "Refunded";
+    default:
+      return status;
+  }
+}
+
+async function notifyStatusChange(tx: Prisma.TransactionClient, args: {
+  parentOrderId: string;
+  sellerOrderGroupId: string;
+  sellerUserId: string;
+  buyerUserId: string;
+  nextStatus: SellerOrderGroupStatus;
+  sellerName: string;
+  farmName: string;
+  logisticsUserId?: string | null;
+  logisticsCompanyName?: string | null;
+  description?: string | null;
+  actorLabel: string;
+}) {
+  const readableStatus = statusLabel(args.nextStatus);
+  const noteSuffix = args.description?.trim() ? ` Note: ${args.description.trim()}` : "";
+
+  await createNotification(tx, {
+    userId: args.sellerUserId,
+    type: NotificationType.ORDER,
+    title: `Order group ${readableStatus}`,
+    body: `${args.actorLabel} updated order group ${args.sellerOrderGroupId} from ${args.farmName} to ${readableStatus}.${noteSuffix}`,
+    targetType: "sellerOrderGroup",
+    targetId: args.sellerOrderGroupId,
+    metadata: toJsonValue({
+      parentOrderId: args.parentOrderId,
+      sellerOrderGroupId: args.sellerOrderGroupId,
+      status: args.nextStatus,
+      description: args.description ?? null,
+    }),
+  });
+
+  await createNotification(tx, {
+    userId: args.buyerUserId,
+    type: NotificationType.ORDER,
+    title: `Order ${args.parentOrderId}: ${readableStatus}`,
+    body: `Order ${args.parentOrderId} is now ${readableStatus.toLowerCase()} for seller group ${args.sellerOrderGroupId}.${noteSuffix}`,
+    targetType: "parentOrder",
+    targetId: args.parentOrderId,
+    metadata: toJsonValue({
+      parentOrderId: args.parentOrderId,
+      sellerOrderGroupId: args.sellerOrderGroupId,
+      sellerName: args.sellerName,
+      farmName: args.farmName,
+      status: args.nextStatus,
+      description: args.description ?? null,
+    }),
+  });
+
+  if (args.logisticsUserId) {
+    await createNotification(tx, {
+      userId: args.logisticsUserId,
+      type: NotificationType.ORDER,
+      title: `Delivery ${readableStatus}`,
+      body: `${args.logisticsCompanyName ?? "Assigned logistics company"} updated delivery ${args.sellerOrderGroupId} to ${readableStatus}.${noteSuffix}`,
+      targetType: "sellerOrderGroup",
+      targetId: args.sellerOrderGroupId,
+      metadata: toJsonValue({
+        parentOrderId: args.parentOrderId,
+        sellerOrderGroupId: args.sellerOrderGroupId,
+        status: args.nextStatus,
+        description: args.description ?? null,
+      }),
+    });
+  }
+}
+
+async function appendOrderGroupStatusHistory(tx: Prisma.TransactionClient, args: {
+  sellerOrderGroupId: string;
+  status: SellerOrderGroupStatus;
+  description?: string | null;
+  updatedByUserId?: string | null;
+  updatedByRole?: UserRole | null;
+}) {
+  const historyId = await reserveSequentialId(tx, "order_group_status_history");
+  await tx.orderGroupStatusHistory.create({
+    data: {
+      id: historyId,
+      sellerOrderGroupId: args.sellerOrderGroupId,
+      status: args.status,
+      description: args.description?.trim() || null,
+      updatedByUserId: args.updatedByUserId ?? null,
+      updatedByRole: args.updatedByRole ?? null,
+    },
+  });
+}
+
+export async function releaseSellerGroupEarnings(tx: Prisma.TransactionClient, sellerOrderGroupId: string) {
+  const group = await tx.sellerOrderGroup.findUnique({
+    where: { id: sellerOrderGroupId },
+    include: {
+      seller: {
+        include: {
+          user: true,
+        },
+      },
+    },
+  });
+
+  if (!group) {
+    throw new Error("SELLER_ORDER_GROUP_NOT_FOUND");
+  }
+
+  const wallet = await getOrCreateSellerWallet(tx, group.sellerId);
+  const releaseKey = `seller-group:${group.id}:release`;
+  const existingRelease = await tx.walletTransaction.findUnique({ where: { idempotencyKey: releaseKey } });
+  if (existingRelease) {
+    return group;
+  }
+
+  const updatedWallet = await tx.sellerWallet.update({
+    where: { id: wallet.id },
+    data: {
+      pendingBalance: {
+        decrement: group.sellerEarningsAmount,
+      },
+      availableBalance: {
+        increment: group.sellerEarningsAmount,
+      },
+    },
+  });
+
+  await createWalletTransaction(tx, {
+    walletId: wallet.id,
+    type: WalletTransactionType.ORDER_AVAILABLE_RELEASE,
+    amount: group.sellerEarningsAmount,
+    pendingBalanceAfter: updatedWallet.pendingBalance,
+    availableBalanceAfter: updatedWallet.availableBalance,
+    processingBalanceAfter: updatedWallet.processingBalance,
+    withdrawnBalanceAfter: updatedWallet.withdrawnBalance,
+    description: `Released seller earnings for order group ${group.id}`,
+    parentOrderId: group.parentOrderId,
+    sellerOrderGroupId: group.id,
+    idempotencyKey: releaseKey,
+    metadata: toJsonValue({
+      sellerEarningsAmount: group.sellerEarningsAmount,
+    }),
+  });
+
+  await createNotification(tx, {
+    userId: group.seller.userId,
+    type: NotificationType.PAYOUT,
+    title: "Earnings released",
+    body: `NGN ${group.sellerEarningsAmount.toLocaleString()} is now available from order group ${group.id}.`,
+    targetType: "sellerOrderGroup",
+    targetId: group.id,
+    metadata: toJsonValue({
+      parentOrderId: group.parentOrderId,
+      sellerOrderGroupId: group.id,
+    }),
+  });
+
+  return group;
+}
+
+export async function finalizeDeliveredSellerGroupInventory(tx: Prisma.TransactionClient, sellerOrderGroupId: string) {
+  const group = await tx.sellerOrderGroup.findUnique({
+    where: { id: sellerOrderGroupId },
+    include: { items: true },
+  });
+
+  if (!group) {
+    throw new Error("SELLER_ORDER_GROUP_NOT_FOUND");
+  }
+
+  for (const item of group.items) {
+    const finalizeKey = `seller-group:${group.id}:inventory-finalize:${item.id}`;
+    const existingFinalize = await tx.inventoryMovement.findUnique({ where: { idempotencyKey: finalizeKey } });
+    if (existingFinalize) continue;
+
+    const reservationMovement = await tx.inventoryMovement.findFirst({
+      where: {
+        orderItemId: item.id,
+        type: InventoryMovementType.RESERVATION,
+      },
+    });
+
+    if (!reservationMovement) continue;
+
+    if (item.variantId) {
+      const variant = await tx.productVariant.findUnique({
+        where: { id: item.variantId },
+        select: { reservedInventory: true },
+      });
+
+      if (!variant || variant.reservedInventory < item.quantity) {
+        throw new Error(`INSUFFICIENT_RESERVED_VARIANT_INVENTORY:${item.variantId}`);
+      }
+
+      await tx.productVariant.update({
+        where: { id: item.variantId },
+        data: {
+          inventory: {
+            decrement: item.quantity,
+          },
+          reservedInventory: {
+            decrement: item.quantity,
+          },
+        },
+      });
+    }
+
+    if (item.productId) {
+      const product = await tx.product.findUnique({
+        where: { id: item.productId },
+        select: { reservedInventory: true },
+      });
+
+      if (!product || product.reservedInventory < item.quantity) {
+        throw new Error(`INSUFFICIENT_RESERVED_PRODUCT_INVENTORY:${item.productId}`);
+      }
+
+      await tx.product.update({
+        where: { id: item.productId },
+        data: {
+          inventory: {
+            decrement: item.quantity,
+          },
+          reservedInventory: {
+            decrement: item.quantity,
+          },
+        },
+      });
+    }
+
+    const movementId = await reserveSequentialId(tx, "inventory_movement");
+    await tx.inventoryMovement.create({
+      data: {
+        id: movementId,
+        sellerId: item.sellerId,
+        productId: item.productId,
+        variantId: item.variantId,
+        orderItemId: item.id,
+        type: InventoryMovementType.SALE_DEDUCTION,
+        quantityDelta: -item.quantity,
+        idempotencyKey: finalizeKey,
+        metadata: toJsonValue({
+          parentOrderId: group.parentOrderId,
+          sellerOrderGroupId: group.id,
+        }),
+      },
+    });
+  }
+
+  return group;
+}
+
+export async function reverseCancelledSellerGroup(tx: Prisma.TransactionClient, sellerOrderGroupId: string) {
+  const group = await tx.sellerOrderGroup.findUnique({
+    where: { id: sellerOrderGroupId },
+    include: {
+      seller: {
+        include: {
+          user: true,
+        },
+      },
+      items: true,
+    },
+  });
+
+  if (!group) {
+    throw new Error("SELLER_ORDER_GROUP_NOT_FOUND");
+  }
+
+  const wallet = await getOrCreateSellerWallet(tx, group.sellerId);
+  const reversalKey = `seller-group:${group.id}:pending-reversal`;
+  const existingReversal = await tx.walletTransaction.findUnique({ where: { idempotencyKey: reversalKey } });
+  const pendingCredit = await tx.walletTransaction.findFirst({
+    where: {
+      walletId: wallet.id,
+      type: WalletTransactionType.ORDER_PENDING_CREDIT,
+      sellerOrderGroupId: group.id,
+    },
+  });
+
+  if (!existingReversal && pendingCredit && group.sellerEarningsAmount > 0) {
+    const updatedWallet = await tx.sellerWallet.update({
+      where: { id: wallet.id },
+      data: {
+        pendingBalance: {
+          decrement: group.sellerEarningsAmount,
+        },
+        totalEarnings: {
+          decrement: group.sellerEarningsAmount,
+        },
+      },
+    });
+
+    await createWalletTransaction(tx, {
+      walletId: wallet.id,
+      type: WalletTransactionType.REFUND_DEBIT,
+      amount: -group.sellerEarningsAmount,
+      pendingBalanceAfter: updatedWallet.pendingBalance,
+      availableBalanceAfter: updatedWallet.availableBalance,
+      processingBalanceAfter: updatedWallet.processingBalance,
+      withdrawnBalanceAfter: updatedWallet.withdrawnBalance,
+      description: `Reversed pending earnings for closed order group ${group.id}`,
+      parentOrderId: group.parentOrderId,
+      sellerOrderGroupId: group.id,
+      idempotencyKey: reversalKey,
+      metadata: toJsonValue({
+        sellerEarningsAmount: group.sellerEarningsAmount,
+      }),
+    });
+  }
+
+  for (const item of group.items) {
+    const releaseKey = `seller-group:${group.id}:inventory-release:${item.id}`;
+    const existingRelease = await tx.inventoryMovement.findUnique({ where: { idempotencyKey: releaseKey } });
+    if (existingRelease) continue;
+
+    const reservationMovement = await tx.inventoryMovement.findFirst({
+      where: {
+        orderItemId: item.id,
+        type: InventoryMovementType.RESERVATION,
+      },
+    });
+
+    if (!reservationMovement) continue;
+
+    if (item.variantId) {
+      const variant = await tx.productVariant.findUnique({
+        where: { id: item.variantId },
+        select: { reservedInventory: true },
+      });
+
+      if (variant && variant.reservedInventory > 0) {
+        await tx.productVariant.update({
+          where: { id: item.variantId },
+          data: {
+            reservedInventory: {
+              decrement: Math.min(item.quantity, variant.reservedInventory),
+            },
+          },
+        });
+      }
+    }
+
+    if (item.productId) {
+      const product = await tx.product.findUnique({
+        where: { id: item.productId },
+        select: { reservedInventory: true },
+      });
+
+      if (product && product.reservedInventory > 0) {
+        await tx.product.update({
+          where: { id: item.productId },
+          data: {
+            reservedInventory: {
+              decrement: Math.min(item.quantity, product.reservedInventory),
+            },
+          },
+        });
+      }
+    }
+
+    const movementId = await reserveSequentialId(tx, "inventory_movement");
+    await tx.inventoryMovement.create({
+      data: {
+        id: movementId,
+        sellerId: item.sellerId,
+        productId: item.productId,
+        variantId: item.variantId,
+        orderItemId: item.id,
+        type: InventoryMovementType.RESERVATION_RELEASE,
+        quantityDelta: item.quantity,
+        idempotencyKey: releaseKey,
+        metadata: toJsonValue({
+          parentOrderId: group.parentOrderId,
+          sellerOrderGroupId: group.id,
+        }),
+      },
+    });
+  }
+
+  await createNotification(tx, {
+    userId: group.seller.userId,
+    type: NotificationType.ORDER,
+    title: "Order group closed",
+    body: `Order group ${group.id} was closed before delivery. Reserved stock was released and pending earnings were reversed where applicable.`,
+    targetType: "sellerOrderGroup",
+    targetId: group.id,
+    metadata: toJsonValue({
+      parentOrderId: group.parentOrderId,
+      sellerOrderGroupId: group.id,
+    }),
+  });
+
+  return group;
+}
+
+export async function updateSellerOrderGroupStatus(args: {
+  sellerOrderGroupId: string;
+  nextStatus: SellerOrderGroupStatus;
+  actorRole: "ADMIN" | "LOGISTICS";
+  actorUserId: string;
+  description?: string | null;
+}) {
+  return prisma.$transaction(async (tx) => {
+    const group = await tx.sellerOrderGroup.findUnique({
+      where: { id: args.sellerOrderGroupId },
+      include: {
+        logisticsCompany: {
+          include: {
+            user: true,
+          },
+        },
+        items: true,
+        seller: {
+          include: {
+            user: true,
+          },
+        },
+        parentOrder: {
+          include: {
+            buyer: {
+              include: {
+                user: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!group) {
+      throw new Error("SELLER_ORDER_GROUP_NOT_FOUND");
+    }
+
+    if (group.status === args.nextStatus) {
+      return tx.sellerOrderGroup.findUniqueOrThrow({
+        where: { id: group.id },
+        include: {
+          items: true,
+          logisticsCompany: { include: { user: true } },
+          statusHistory: {
+            include: {
+              updatedByUser: {
+                select: {
+                  id: true,
+                  fullName: true,
+                  role: true,
+                },
+              },
+            },
+            orderBy: { createdAt: "asc" },
+          },
+          seller: { include: { user: true } },
+          parentOrder: {
+            include: {
+              addressSnapshot: true,
+              payment: true,
+              buyer: { include: { user: true } },
+            },
+          },
+        },
+      });
+    }
+
+    if (group.status === SellerOrderGroupStatus.CANCELLED || group.status === SellerOrderGroupStatus.REFUNDED) {
+      throw new Error("ORDER_GROUP_ALREADY_CLOSED");
+    }
+
+    if (
+      group.status === SellerOrderGroupStatus.DELIVERED &&
+      (args.nextStatus === SellerOrderGroupStatus.CANCELLED || args.nextStatus === SellerOrderGroupStatus.REFUNDED)
+    ) {
+      throw new Error("DELIVERED_GROUP_CANNOT_BE_CANCELLED_HERE");
+    }
+
+    if (args.actorRole === "LOGISTICS") {
+      if (!group.logisticsCompanyId || !group.logisticsCompany || group.logisticsCompany.userId !== args.actorUserId) {
+        throw new Error("LOGISTICS_NOT_ASSIGNED_TO_ORDER_GROUP");
+      }
+
+      if (
+        group.status === SellerOrderGroupStatus.PENDING ||
+        args.nextStatus === SellerOrderGroupStatus.PENDING ||
+        args.nextStatus === SellerOrderGroupStatus.CONFIRMED ||
+        args.nextStatus === SellerOrderGroupStatus.REFUNDED
+      ) {
+        throw new Error("INVALID_LOGISTICS_STATUS_TRANSITION");
+      }
+    }
+
+    await tx.sellerOrderGroup.update({
+      where: { id: group.id },
+      data: { status: args.nextStatus },
+    });
+
+    await appendOrderGroupStatusHistory(tx, {
+      sellerOrderGroupId: group.id,
+      status: args.nextStatus,
+      description: args.description,
+      updatedByUserId: args.actorUserId,
+      updatedByRole: args.actorRole === "ADMIN" ? UserRole.ADMIN : UserRole.LOGISTICS,
+    });
+
+    if (args.nextStatus === SellerOrderGroupStatus.DELIVERED) {
+      await finalizeDeliveredSellerGroupInventory(tx, group.id);
+      await releaseSellerGroupEarnings(tx, group.id);
+    }
+
+    if (
+      args.nextStatus === SellerOrderGroupStatus.CANCELLED ||
+      args.nextStatus === SellerOrderGroupStatus.REFUNDED
+    ) {
+      await reverseCancelledSellerGroup(tx, group.id);
+    }
+
+    await notifyStatusChange(tx, {
+      parentOrderId: group.parentOrderId,
+      sellerOrderGroupId: group.id,
+      sellerUserId: group.seller.userId,
+      buyerUserId: group.parentOrder.buyer.userId,
+      nextStatus: args.nextStatus,
+      sellerName: group.sellerNameSnapshot,
+      farmName: group.farmNameSnapshot,
+      logisticsUserId: group.logisticsCompany?.userId ?? null,
+      logisticsCompanyName: group.logisticsCompanyNameSnapshot ?? group.logisticsCompany?.companyName ?? null,
+      description: args.description,
+      actorLabel: args.actorRole === "ADMIN"
+        ? "Admin"
+        : (group.logisticsCompanyNameSnapshot ?? group.logisticsCompany?.companyName ?? "Logistics"),
+    });
+
+    if (args.actorRole === "ADMIN") {
+      await createAuditLog(tx, {
+        adminId: args.actorUserId,
+        action: "order_group.status.update",
+        targetType: "sellerOrderGroup",
+        targetId: group.id,
+        metadata: toJsonValue({
+          parentOrderId: group.parentOrderId,
+          previousStatus: group.status,
+          nextStatus: args.nextStatus,
+          description: args.description ?? null,
+        }),
+      });
+    }
+
+    await syncParentOrderStatusFromGroups(tx, group.parentOrderId);
+
+    return tx.sellerOrderGroup.findUniqueOrThrow({
+      where: { id: group.id },
+      include: {
+        items: true,
+        logisticsCompany: { include: { user: true } },
+        statusHistory: {
+          include: {
+            updatedByUser: {
+              select: {
+                id: true,
+                fullName: true,
+                role: true,
+              },
+            },
+          },
+          orderBy: { createdAt: "asc" },
+        },
+        seller: { include: { user: true } },
+        parentOrder: {
+          include: {
+            addressSnapshot: true,
+            payment: true,
+            buyer: { include: { user: true } },
+          },
+        },
+      },
+    });
+  });
+}

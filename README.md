@@ -440,7 +440,7 @@ MOBILE_API_BASE_URL
 Default fallback:
 
 ```text
-https://agritec-api.vercel.app
+https://agritecng-api.vercel.app
 ```
 
 Example local run override:
@@ -454,7 +454,7 @@ Notes:
 - use `10.0.2.2` for Android emulator talking to a backend on your host machine
 - use your machine's LAN IP for a physical device
 - use your deployed API domain for staging/production builds
-- if you do not pass `MOBILE_API_BASE_URL`, the app falls back to `https://agritec-api.vercel.app`
+- if you do not pass `MOBILE_API_BASE_URL`, the app falls back to `https://agritecng-api.vercel.app`
 
 ### 4. Database setup
 

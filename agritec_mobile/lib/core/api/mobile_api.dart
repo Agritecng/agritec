@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import 'package:dio/dio.dart';
 
-const _defaultMobileApiBaseUrl = 'https://agritec-api.vercel.app';
+const _defaultMobileApiBaseUrl = 'https://agritecng-api.vercel.app';
 const mobileApiBaseUrl = String.fromEnvironment(
   'MOBILE_API_BASE_URL',
   defaultValue: _defaultMobileApiBaseUrl,

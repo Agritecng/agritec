@@ -2,7 +2,7 @@
 
 export const sellerApiBaseUrl =
   process.env.NEXT_PUBLIC_API_BASE_URL?.trim() ||
-  "https://agritec-api.vercel.app";
+  "https://agritecng-api.vercel.app";
 
 export type ApiError = {
   success?: false;

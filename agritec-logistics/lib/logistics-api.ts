@@ -2,7 +2,7 @@
 
 export const logisticsApiBaseUrl =
   process.env.NEXT_PUBLIC_API_BASE_URL?.trim() ||
-  "https://agritec-api.vercel.app";
+  "https://agritecng-api.vercel.app";
 
 type RequestOptions = RequestInit & {
   token?: string | null;
